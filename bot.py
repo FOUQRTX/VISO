@@ -39,7 +39,7 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-PROXYAPI_URL = "https://proxyapi.ru"
+PROXYAPI_URL = "https://api.proxyapi.ru/v1"
 # --- БАЗА ДАННЫХ ---
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 try:
