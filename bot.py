@@ -30,17 +30,16 @@ logger = logging.getLogger(__name__)
 # --- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ---
 TOKEN = os.getenv("BOT_TOKEN")
 AI_API_KEY = os.getenv("AI_API_KEY")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID") or "0")
 
-if not TOKEN or not AI_API_KEY:
-    logger.error("❌ Не заданы BOT_TOKEN или AI_API_KEY!")
+if not TOKEN:
+    logger.error("❌ Не задан BOT_TOKEN!")
     sys.exit(1)
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 PROXYAPI_URL = "https://proxyapi.ru"
-
 # --- БАЗА ДАННЫХ ---
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 try:
