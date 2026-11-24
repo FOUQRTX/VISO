@@ -8,7 +8,7 @@ import base64
 from io import BytesIO
 from pathlib import Path
 
-import aiohttp
+from openai import AsyncOpenAI
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, CommandObject, Command
 from aiogram.types import (
@@ -19,9 +19,15 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s | %(levelname)s | %(message)s")
+# --- ЛОГИРОВАНИЕ ---
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stdout,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 logger = logging.getLogger(__name__)
 
+# --- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ---
 TOKEN = os.getenv("BOT_TOKEN")
 AI_API_KEY = os.getenv("AI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -33,8 +39,13 @@ if not TOKEN or not AI_API_KEY:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-PROXYAPI_BASE = "https://proxyapi.ru"
+# --- КЛИЕНТ PROXYAPI ---
+ai_client = AsyncOpenAI(
+    api_key=AI_API_KEY,
+    base_url="https://proxyapi.ru"
+)
 
+# --- БАЗА ДАННЫХ ---
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 try:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -45,23 +56,48 @@ except Exception:
 conn = sqlite3.connect(DATA_DIR / "users.db", check_same_thread=False)
 cursor = conn.cursor()
 
-cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 3, referrals INTEGER DEFAULT 0)")
-cursor.execute("CREATE TABLE IF NOT EXISTS promocodes (code TEXT PRIMARY KEY, reward INTEGER, uses_left INTEGER)")
-cursor.execute("CREATE TABLE IF NOT EXISTS used_promos (user_id INTEGER, code TEXT, PRIMARY KEY (user_id, code))")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        balance INTEGER DEFAULT 3,
+        referrals INTEGER DEFAULT 0
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS promocodes (
+        code TEXT PRIMARY KEY,
+        reward INTEGER,
+        uses_left INTEGER
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS used_promos (
+        user_id INTEGER,
+        code TEXT,
+        PRIMARY KEY (user_id, code)
+    )
+""")
 conn.commit()
 
+
+# --- ХЕЛПЕРЫ БД ---
 def get_user(user_id: int):
     cursor.execute("SELECT balance, referrals FROM users WHERE user_id = ?", (user_id,))
     return cursor.fetchone()
+
 
 def add_user(user_id: int, referrer_id: int | None = None) -> bool:
     if not get_user(user_id):
         cursor.execute("INSERT INTO users (user_id, balance, referrals) VALUES (?, 3, 0)", (user_id,))
         if referrer_id and referrer_id != user_id and get_user(referrer_id):
-            cursor.execute("UPDATE users SET balance = balance + 1, referrals = referrals + 1 WHERE user_id = ?", (referrer_id,))
+            cursor.execute(
+                "UPDATE users SET balance = balance + 1, referrals = referrals + 1 WHERE user_id = ?",
+                (referrer_id,)
+            )
         conn.commit()
         return True
     return False
+
 
 def ensure_user(user_id: int):
     user = get_user(user_id)
@@ -70,16 +106,21 @@ def ensure_user(user_id: int):
         user = get_user(user_id)
     return user
 
+
 def change_balance(user_id: int, amount: int):
     cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
     conn.commit()
 
+
+# --- СОСТОЯНИЯ ---
 class BotStates(StatesGroup):
     waiting_for_prompt = State()
     waiting_for_photo = State()
     waiting_for_edit_prompt = State()
     waiting_for_promo = State()
 
+
+# --- КЛАВИАТУРА ---
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🎨 Создать картинку"), KeyboardButton(text="✏️ Редактировать фото")],
@@ -88,6 +129,9 @@ main_kb = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True
 )
+
+
+# --- /START ---
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandObject, state: FSMContext):
     await state.clear()
@@ -96,7 +140,11 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
 
     if add_user(user_id, referrer_id) and referrer_id:
         try:
-            await bot.send_message(referrer_id, "🎉 По вашей ссылке зарегистрировался друг! Вам начислена <b>+1 генерация</b>.", parse_mode="HTML")
+            await bot.send_message(
+                referrer_id,
+                "🎉 По вашей ссылке зарегистрировался друг! Вам начислена <b>+1 генерация</b>.",
+                parse_mode="HTML"
+            )
         except Exception:
             pass
 
@@ -107,33 +155,50 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
         reply_markup=main_kb,
         parse_mode="HTML"
     )
-
+# --- АДМИНКА: СОЗДАНИЕ ПРОМОКОДА ---
 @dp.message(Command("addpromo"))
 async def add_promo_cmd(message: types.Message, command: CommandObject):
     if message.from_user.id != ADMIN_ID:
         return
     if not command.args:
-        await message.answer("Формат: <code>/addpromo КОД НАГРАДА АКТИВАЦИИ</code>\nПример: <code>/addpromo BONUS5 5 50</code>", parse_mode="HTML")
+        await message.answer(
+            "Формат: <code>/addpromo КОД НАГРАДА АКТИВАЦИИ</code>\n"
+            "Пример: <code>/addpromo BONUS5 5 50</code>",
+            parse_mode="HTML"
+        )
         return
     try:
         parts = command.args.split()
-        code, reward, uses = parts.upper(), int(parts), int(parts)
+        code, reward, uses = parts[0].upper(), int(parts[1]), int(parts[2])
         if reward <= 0 or uses <= 0:
             await message.answer("❌ Награда и активации должны быть больше 0!")
             return
         cursor.execute("DELETE FROM used_promos WHERE code = ?", (code,))
-        cursor.execute("INSERT OR REPLACE INTO promocodes (code, reward, uses_left) VALUES (?, ?, ?)", (code, reward, uses))
+        cursor.execute(
+            "INSERT OR REPLACE INTO promocodes (code, reward, uses_left) VALUES (?, ?, ?)",
+            (code, reward, uses)
+        )
         conn.commit()
         await message.answer(f"✅ Код <code>{code}</code> создан (+{reward} ген., {uses} акт.)", parse_mode="HTML")
     except Exception as e:
         await message.answer(f"❌ Пример: <code>/addpromo BONUS5 5 50</code>\nОшибка: {html.escape(str(e))}", parse_mode="HTML")
 
+
+# --- ПРОФИЛЬ ---
 @dp.message(F.text == "👤 Мой профиль")
 async def profile_handler(message: types.Message, state: FSMContext):
     await state.clear()
     user = ensure_user(message.from_user.id)
-    await message.answer(f"👤 <b>Профиль</b>\n\n🆔 ID: <code>{message.from_user.id}</code>\n⚡ Баланс: <b>{user} шт.</b>\n👥 Друзей: <b>{user}</b>", parse_mode="HTML")
+    await message.answer(
+        f"👤 <b>Профиль</b>\n\n"
+        f"🆔 ID: <code>{message.from_user.id}</code>\n"
+        f"⚡ Баланс: <b>{user[0]} шт.</b>\n"
+        f"👥 Друзей: <b>{user[1]}</b>",
+        parse_mode="HTML"
+    )
 
+
+# --- ПРАЙС ---
 @dp.message(F.text == "💎 Прайс и Пополнение")
 async def price_handler(message: types.Message, state: FSMContext):
     await state.clear()
@@ -144,25 +209,38 @@ async def price_handler(message: types.Message, state: FSMContext):
     ])
     await message.answer("💎 <b>Тарифы VISO AI</b>\nВыберите пакет ниже 👇", reply_markup=pay_kb, parse_mode="HTML")
 
+
 @dp.callback_query(F.data.startswith("buy_"))
 async def process_buy(callback: types.CallbackQuery):
-    pack = callback.data.split("_")
+    pack = callback.data.split("_")[1]
     await callback.answer()
-    await callback.message.answer(f"💳 Выбран пакет на <b>{html.escape(pack)} генераций</b>. Оплата скоро будет подключена!", parse_mode="HTML")
+    await callback.message.answer(
+        f"💳 Выбран пакет на <b>{html.escape(pack)} генераций</b>. Оплата скоро будет подключена!",
+        parse_mode="HTML"
+    )
 
+
+# --- РЕФЕРАЛКА ---
 @dp.message(F.text == "🎁 Пригласить друга")
 async def referral_handler(message: types.Message, state: FSMContext):
     await state.clear()
     bot_info = await bot.get_me()
-    ref_link = "https://t.me" + bot_info.username + "?start=" + str(message.from_user.id)
-    await message.answer(f"🎁 За каждого друга по ссылке вы получите <b>+1 генерацию</b>!\n\n🔗 Ваша ссылка:\n<code>{ref_link}</code>", parse_mode="HTML")
+    ref_link = f"https://t.me{bot_info.username}?start={message.from_user.id}"
+    await message.answer(
+        f"🎁 За каждого друга по ссылке вы получите <b>+1 генерацию</b>!\n\n"
+        f"🔗 Ваша ссылка (нажмите, чтобы скопировать):\n<code>{ref_link}</code>",
+        parse_mode="HTML"
+    )
 
+
+# --- БОНУС-КОД ---
 @dp.message(F.text == "🎟 Ввести бонус-код")
 async def promo_start(message: types.Message, state: FSMContext):
     await state.clear()
     ensure_user(message.from_user.id)
     await state.set_state(BotStates.waiting_for_promo)
     await message.answer("🎟 Введите ваш бонус-код:")
+
 
 @dp.message(BotStates.waiting_for_promo)
 async def promo_process(message: types.Message, state: FSMContext):
@@ -175,7 +253,7 @@ async def promo_process(message: types.Message, state: FSMContext):
     cursor.execute("SELECT reward, uses_left FROM promocodes WHERE code = ?", (code,))
     promo = cursor.fetchone()
 
-    if not promo or promo <= 0:
+    if not promo or promo[1] <= 0:
         await message.answer("❌ Бонус-код не найден или закончился.")
         await state.clear()
         return
@@ -188,10 +266,13 @@ async def promo_process(message: types.Message, state: FSMContext):
 
     cursor.execute("INSERT INTO used_promos (user_id, code) VALUES (?, ?)", (user_id, code))
     cursor.execute("UPDATE promocodes SET uses_left = uses_left - 1 WHERE code = ?", (code,))
-    change_balance(user_id, promo)
+    change_balance(user_id, promo[0])
     conn.commit()
 
-    await message.answer(f"🎉 Код <b>{html.escape(code)}</b> активирован! Начислено: <b>+{promo} генераций</b>.", parse_mode="HTML")
+    await message.answer(
+        f"🎉 Код <b>{html.escape(code)}</b> активирован! Начислено: <b>+{promo[0]} генераций</b>.",
+        parse_mode="HTML"
+    )
     await state.clear()
 # --- ГЕНЕРАЦИЯ КАРТИНКИ ---
 @dp.message(F.text == "🎨 Создать картинку")
