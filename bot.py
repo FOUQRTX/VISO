@@ -54,7 +54,7 @@ cursor = conn.cursor()
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
-        balance INTEGER DEFAULT 3,
+        balance INTEGER DEFAULT 1,
         referrals INTEGER DEFAULT 0
     )
 """)
@@ -83,7 +83,7 @@ def get_user(user_id: int):
 
 def add_user(user_id: int, referrer_id: int | None = None) -> bool:
     if not get_user(user_id):
-        cursor.execute("INSERT INTO users (user_id, balance, referrals) VALUES (?, 3, 0)", (user_id,))
+        cursor.execute("INSERT INTO users (user_id, balance, referrals) VALUES (?, 1, 0)", (user_id,))
         if referrer_id and referrer_id != user_id and get_user(referrer_id):
             cursor.execute(
                 "UPDATE users SET balance = balance + 1, referrals = referrals + 1 WHERE user_id = ?",
