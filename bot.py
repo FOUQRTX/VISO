@@ -8,7 +8,7 @@ import base64
 from io import BytesIO
 from pathlib import Path
 
-from openai import AsyncOpenAI
+import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, CommandObject, Command
 from aiogram.types import (
@@ -39,11 +39,7 @@ if not TOKEN or not AI_API_KEY:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- КЛИЕНТ PROXYAPI ---
-ai_client = AsyncOpenAI(
-    api_key=AI_API_KEY,
-    base_url="https://proxyapi.ru"
-)
+PROXYAPI_URL = "https://proxyapi.ru"
 
 # --- БАЗА ДАННЫХ ---
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -188,12 +184,12 @@ async def add_promo_cmd(message: types.Message, command: CommandObject):
 @dp.message(F.text == "👤 Мой профиль")
 async def profile_handler(message: types.Message, state: FSMContext):
     await state.clear()
-    user = ensure_user(message.from_user.id)
+    balance, refs = ensure_user(message.from_user.id)
     await message.answer(
         f"👤 <b>Профиль</b>\n\n"
         f"🆔 ID: <code>{message.from_user.id}</code>\n"
-        f"⚡ Баланс: <b>{user[0]} шт.</b>\n"
-        f"👥 Друзей: <b>{user[1]}</b>",
+        f"⚡ Баланс: <b>{balance} шт.</b>\n"
+        f"👥 Друзей: <b>{refs}</b>",
         parse_mode="HTML"
     )
 
@@ -212,7 +208,7 @@ async def price_handler(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def process_buy(callback: types.CallbackQuery):
-    pack = callback.data.split("_")[1]
+    _, pack = callback.data.split("_", 1)
     await callback.answer()
     await callback.message.answer(
         f"💳 Выбран пакет на <b>{html.escape(pack)} генераций</b>. Оплата скоро будет подключена!",
@@ -253,8 +249,14 @@ async def promo_process(message: types.Message, state: FSMContext):
     cursor.execute("SELECT reward, uses_left FROM promocodes WHERE code = ?", (code,))
     promo = cursor.fetchone()
 
-    if not promo or promo[1] <= 0:
-        await message.answer("❌ Бонус-код не найден или закончился.")
+    if not promo:
+        await message.answer("❌ Бонус-код не найден.")
+        await state.clear()
+        return
+
+    reward, uses_left = promo
+    if uses_left <= 0:
+        await message.answer("❌ Лимит активаций этого бонус-кода исчерпан.")
         await state.clear()
         return
 
@@ -266,11 +268,11 @@ async def promo_process(message: types.Message, state: FSMContext):
 
     cursor.execute("INSERT INTO used_promos (user_id, code) VALUES (?, ?)", (user_id, code))
     cursor.execute("UPDATE promocodes SET uses_left = uses_left - 1 WHERE code = ?", (code,))
-    change_balance(user_id, promo[0])
+    change_balance(user_id, reward)
     conn.commit()
 
     await message.answer(
-        f"🎉 Код <b>{html.escape(code)}</b> активирован! Начислено: <b>+{promo[0]} генераций</b>.",
+        f"🎉 Код <b>{html.escape(code)}</b> активирован! Начислено: <b>+{reward} генераций</b>.",
         parse_mode="HTML"
     )
     await state.clear()
@@ -278,8 +280,8 @@ async def promo_process(message: types.Message, state: FSMContext):
 @dp.message(F.text == "🎨 Создать картинку")
 async def create_image_start(message: types.Message, state: FSMContext):
     await state.clear()
-    user = ensure_user(message.from_user.id)
-    if user[0] <= 0:
+    balance, _ = ensure_user(message.from_user.id)
+    if balance <= 0:
         await message.answer("❌ Закончились генерации! Пригласите друга или введите бонус-код.")
         return
     await state.set_state(BotStates.waiting_for_prompt)
@@ -292,8 +294,8 @@ async def create_image_process(message: types.Message, state: FSMContext):
         await message.answer("❌ Опишите картинку текстом.")
         return
 
-    user = ensure_user(message.from_user.id)
-    if user[0] <= 0:
+    balance, _ = ensure_user(message.from_user.id)
+    if balance <= 0:
         await message.answer("❌ Закончились генерации!")
         await state.clear()
         return
@@ -301,14 +303,25 @@ async def create_image_process(message: types.Message, state: FSMContext):
     wait_msg = await message.answer("⏳ Рисую (15–20 сек)...")
     try:
         prompt_text = message.text.strip()[:500]
-        response = await ai_client.images.generate(
-            model="gpt-image-1",
-            prompt=prompt_text,
-            size="1024x1024",
-            quality="medium",
-            n=1
-        )
-        image_bytes = base64.b64decode(response.data[0].b64_json)
+        headers = {
+            "Authorization": f"Bearer {AI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "gpt-image-1",
+            "prompt": prompt_text,
+            "size": "1024x1024",
+            "quality": "medium",
+            "n": 1
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{PROXYAPI_URL}/images/generations", json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    raise RuntimeError(f"API {resp.status}: {err_text}")
+                result = await resp.json()
+
+        image_bytes = base64.b64decode(result["data"][0]["b64_json"])
         await message.answer_photo(
             BufferedInputFile(image_bytes, filename="result.png"),
             caption=f"✨ <b>Готово!</b>\n📝 <i>{html.escape(prompt_text)}</i>",
@@ -326,8 +339,8 @@ async def create_image_process(message: types.Message, state: FSMContext):
 @dp.message(F.text == "✏️ Редактировать фото")
 async def edit_photo_start(message: types.Message, state: FSMContext):
     await state.clear()
-    user = ensure_user(message.from_user.id)
-    if user[0] <= 0:
+    balance, _ = ensure_user(message.from_user.id)
+    if balance <= 0:
         await message.answer("❌ Закончились генерации! Пригласите друга или введите бонус-код.")
         return
     await state.set_state(BotStates.waiting_for_photo)
@@ -352,8 +365,8 @@ async def edit_photo_process(message: types.Message, state: FSMContext):
         await message.answer("❌ Напишите задачу текстом.")
         return
 
-    user = ensure_user(message.from_user.id)
-    if user[0] <= 0:
+    balance, _ = ensure_user(message.from_user.id)
+    if balance <= 0:
         await message.answer("❌ Закончились генерации!")
         await state.clear()
         return
@@ -367,15 +380,22 @@ async def edit_photo_process(message: types.Message, state: FSMContext):
         photo_io = BytesIO()
         await bot.download_file(file_info.file_path, photo_io)
         photo_io.seek(0)
-        photo_io.name = "image.jpg"
 
-        response = await ai_client.images.edit(
-            model="gpt-image-1",
-            image=photo_io,
-            prompt=edit_prompt,
-            size="1024x1024"
-        )
-        result_bytes = base64.b64decode(response.data[0].b64_json)
+        form = aiohttp.FormData()
+        form.add_field("model", "gpt-image-1")
+        form.add_field("prompt", edit_prompt)
+        form.add_field("size", "1024x1024")
+        form.add_field("image", photo_io, filename="image.jpg", content_type="image/jpeg")
+
+        headers = {"Authorization": f"Bearer {AI_API_KEY}"}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{PROXYAPI_URL}/images/edits", data=form, headers=headers) as resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    raise RuntimeError(f"API {resp.status}: {err_text}")
+                result = await resp.json()
+
+        result_bytes = base64.b64decode(result["data"][0]["b64_json"])
         await message.answer_photo(
             BufferedInputFile(result_bytes, filename="edited.png"),
             caption=f"✨ <b>Готово!</b>\n📝 <i>{html.escape(edit_prompt)}</i>",
