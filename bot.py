@@ -307,7 +307,7 @@ async def create_image_process(message: types.Message, state: FSMContext):
             "Content-Type": "application/json"
         }
         payload = {
-            "model": "gpt-image-1",
+            "model": "gpt-image-1.5",
             "prompt": prompt_text,
             "size": "1024x1024",
             "quality": "medium",
@@ -381,7 +381,7 @@ async def edit_photo_process(message: types.Message, state: FSMContext):
         photo_io.seek(0)
 
         form = aiohttp.FormData()
-        form.add_field("model", "gpt-image-1")
+        form.add_field("model", "gpt-image-1.5")
         form.add_field("prompt", edit_prompt)
         form.add_field("size", "1024x1024")
         form.add_field("image", photo_io, filename="image.jpg", content_type="image/jpeg")
