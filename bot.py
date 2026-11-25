@@ -5,8 +5,12 @@ import asyncio
 import sqlite3
 import logging
 import base64
+import uuid
+import zipfile
+import io
 from io import BytesIO
 from pathlib import Path
+from typing import Optional
 
 import aiohttp
 from aiogram import Bot, Dispatcher, types, F
@@ -18,6 +22,8 @@ from aiogram.types import (
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from PIL import Image
+from rembg import remove
 
 # ============ ЛОГИРОВАНИЕ ============
 logging.basicConfig(
@@ -43,11 +49,18 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 PROXYAPI_URL = "https://api.proxyapi.ru/openai/v1"
-MODEL = "gpt-image-1.5"          # если ProxyAPI не поддерживает — поменяйте на "gpt-image-1"
-FREE_GENERATIONS = 3             # стартовый баланс
+MODEL = "gpt-image-1.5"
+FREE_GENERATIONS = 3
+
+# ============ ЦЕНЫ ============
+PRICE_SINGLE = 1
+PRICE_PACK_3 = 2
+PRICE_PACK_5 = 4
+PRICE_REDO = 1
+FREE_REDO_PER_PACK = 1
 
 # ============ БАЗА ДАННЫХ ============
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
+DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 try:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 except Exception:
@@ -61,7 +74,8 @@ cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         balance INTEGER DEFAULT 3,
-        referrals INTEGER DEFAULT 0
+        referrals INTEGER DEFAULT 0,
+        onboarded INTEGER DEFAULT 0
     )
 """)
 cursor.execute("""
@@ -84,19 +98,29 @@ cursor.execute("""
         user_id INTEGER
     )
 """)
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS packs (
+        pack_id TEXT PRIMARY KEY,
+        user_id INTEGER,
+        size INTEGER,
+        category TEXT,
+        style TEXT,
+        redo_used INTEGER DEFAULT 0,
+        file_ids TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
 conn.commit()
-
 
 # ============ ХЕЛПЕРЫ БД ============
 def get_user(user_id: int):
-    cursor.execute("SELECT balance, referrals FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT balance, referrals, onboarded FROM users WHERE user_id = ?", (user_id,))
     return cursor.fetchone()
 
-
-def add_user(user_id: int, referrer_id: int | None = None) -> bool:
+def add_user(user_id: int, referrer_id: Optional[int] = None) -> bool:
     if not get_user(user_id):
         cursor.execute(
-            "INSERT INTO users (user_id, balance, referrals) VALUES (?, ?, 0)",
+            "INSERT INTO users (user_id, balance, referrals, onboarded) VALUES (?, ?, 0, 0)",
             (user_id, FREE_GENERATIONS)
         )
         if referrer_id and referrer_id != user_id and get_user(referrer_id):
@@ -108,7 +132,6 @@ def add_user(user_id: int, referrer_id: int | None = None) -> bool:
         return True
     return False
 
-
 def ensure_user(user_id: int):
     user = get_user(user_id)
     if not user:
@@ -116,27 +139,25 @@ def ensure_user(user_id: int):
         user = get_user(user_id)
     return user
 
-
 def change_balance(user_id: int, amount: int):
     cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
     conn.commit()
 
-
-def try_deduct_balance(user_id: int) -> bool:
-    """Атомарно списывает 1 генерацию. Возвращает True при успехе."""
+def try_deduct_balance(user_id: int, amount: int) -> bool:
     cursor.execute(
-        "UPDATE users SET balance = balance - 1 WHERE user_id = ? AND balance > 0",
-        (user_id,)
+        "UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
+        (amount, user_id, amount)
     )
     conn.commit()
     return cursor.rowcount > 0
 
-
-def refund_balance(user_id: int):
-    """Возвращает 1 генерацию при ошибке API."""
-    cursor.execute("UPDATE users SET balance = balance + 1 WHERE user_id = ?", (user_id,))
+def refund_balance(user_id: int, amount: int):
+    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
     conn.commit()
 
+def set_onboarded(user_id: int):
+    cursor.execute("UPDATE users SET onboarded = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
 
 # ============ СОСТОЯНИЯ ============
 class BotStates(StatesGroup):
@@ -146,20 +167,34 @@ class BotStates(StatesGroup):
     waiting_for_promo = State()
     waiting_for_support = State()
 
-
-# ============ КЛАВИАТУРА ============
+# ============ КЛАВИАТУРЫ ============
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📦 Карточка товара"), KeyboardButton(text="🎨 Создать картинку")],
-        [KeyboardButton(text="👤 Мой профиль"),     KeyboardButton(text="💎 Тарифы")],
-        [KeyboardButton(text="🎁 Пригласить друга"), KeyboardButton(text="🎟 Бонус-код")],
-        [KeyboardButton(text="🆘 Помощь и Правила")]
+        [KeyboardButton(text="🎨 Создать пак"), KeyboardButton(text="👤 Мой профиль")],
+        [KeyboardButton(text="💎 Тарифы"), KeyboardButton(text="🎁 Пригласить друга")],
+        [KeyboardButton(text="🎟 Бонус-код"), KeyboardButton(text="🆘 Помощь и Правила")]
     ],
     resize_keyboard=True
 )
 
+def get_style_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Минимализм ⬜", callback_data="style:minimal")],
+        [InlineKeyboardButton(text="Эко 🌿", callback_data="style:eco")],
+        [InlineKeyboardButton(text="Премиум 💎", callback_data="style:premium")],
+        [InlineKeyboardButton(text="Неон ⚡", callback_data="style:neon")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
+    ])
 
-# ============ КОМАНДЫ ============
+def get_pack_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 карточка — 1 генерация", callback_data="pack:1")],
+        [InlineKeyboardButton(text="3 карточки — 2 генерации (выгода)", callback_data="pack:3")],
+        [InlineKeyboardButton(text="5 карточек — 4 генерации (макс. выгода)", callback_data="pack:5")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
+    ])
+
+# ============ /START ============
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandObject, state: FSMContext):
     await state.clear()
@@ -167,6 +202,8 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
     referrer_id = int(command.args) if (command.args and command.args.isdigit()) else None
 
     is_new = add_user(user_id, referrer_id)
+    user = get_user(user_id)
+
     if is_new and referrer_id:
         try:
             await bot.send_message(
@@ -177,154 +214,324 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
         except Exception:
             pass
 
+    if not user[2]:  # onboarded == 0
+        await message.answer(
+            "👋 Добро пожаловать в <b>VISO AI</b>!\n\n"
+            "Мы создаём продающие карточки для Ozon и WB.\n"
+            f"🎁 Вам доступно <b>{FREE_GENERATIONS} бесплатные генерации</b>.\n\n"
+            "Давайте создадим первую карточку? 👇",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="▶️ Начать тур", callback_data="start_tour")],
+                [InlineKeyboardButton(text="❌ Пропустить", callback_data="skip_tour")]
+            ]),
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer("👋 С возвращением! Выберите действие ниже 👇", reply_markup=main_kb)
+
+@dp.callback_query(F.data == "start_tour")
+async def start_tour(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    set_onboarded(cb.from_user.id)
+    await cb.message.edit_text("🎨 <b>Шаг 1 из 2:</b> Нажмите «🎨 Создать пак» в меню ниже и загрузите фото.", reply_markup=main_kb, parse_mode="HTML")
+
+@dp.callback_query(F.data == "skip_tour")
+async def skip_tour(cb: types.CallbackQuery):
+    await cb.answer()
+    set_onboarded(cb.from_user.id)
+    await cb.message.edit_text("👌 Ок! Вы всегда можете вернуться к инструкции в разделе «🆘 Помощь».", reply_markup=main_kb)
+
+# ============ ОСНОВНЫЕ ХЕНДЛЕРЫ ============
+@dp.message(F.text == "🎨 Создать пак")
+async def create_pack_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    user = ensure_user(message.from_user.id)
+    if user[0] <= 0:
+        await message.answer("❌ Закончились генерации! Пополните баланс в разделе «💎 Тарифы».")
+        return
+    await message.answer("📦 Выберите размер пака:", reply_markup=get_pack_kb())
+
+@dp.callback_query(F.data.startswith("pack:"))
+async def process_pack_size(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    size = int(cb.data.split(":")[1])
+    price = {1: PRICE_SINGLE, 3: PRICE_PACK_3, 5: PRICE_PACK_5}.get(size, size)
+    
+    user = ensure_user(cb.from_user.id)
+    if user[0] < price:
+        await cb.message.edit_text(f"❌ Недостаточно генераций для пака на {size} шт. Нужно: {price}. У вас: {user[0]}.")
+        return
+    
+    await state.update_data(pack_size=size, pack_price=price)
+    await state.set_state(BotStates.waiting_for_photo)
+    await cb.message.edit_text(
+        f"✅ Выбран пак: {size} карточек.\n"
+        f"Спишется: {price} генераций.\n\n"
+        f"📸 Теперь загрузите фото вашего товара:"
+    )
+
+@dp.message(BotStates.waiting_for_photo, F.photo)
+async def process_photo(message: types.Message, state: FSMContext):
+    await state.update_data(photo_id=message.photo[-1].file_id)
+    await state.set_state(BotStates.waiting_for_prompt)
     await message.answer(
-        f"👋 Добро пожаловать в <b>VISO AI</b> — ИИ-студию для селлеров Ozon и Wildberries!\n\n"
-        f"📸 Превращаем фото товара в продающую карточку 3:4 за 20 секунд.\n"
-        f"🎁 Вам доступны <b>{FREE_GENERATIONS} бесплатные генерации</b>.\n\n"
-        f"Выберите действие в меню ниже 👇",
-        reply_markup=main_kb,
+        "✍️ Напишите описание стиля.\n"
+        "<i>Например: «на светлом мраморном столике, мягкий свет, эко-стиль».</i>",
         parse_mode="HTML"
     )
 
+@dp.message(BotStates.waiting_for_photo, ~F.photo)
+async def wrong_photo(message: types.Message):
+    await message.answer("❌ Отправьте именно <b>фотографию</b> (не файлом).", parse_mode="HTML")
 
-@dp.message(Command("cancel"))
-async def cancel_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer("❌ Действие отменено.", reply_markup=main_kb)
-
-
-@dp.message(Command("help"))
-async def help_cmd(message: types.Message, state: FSMContext):
-    await help_handler(message, state)
-
-
-@dp.message(Command("addpromo"))
-async def add_promo_cmd(message: types.Message, command: CommandObject):
-    if message.from_user.id != ADMIN_ID:
+@dp.message(BotStates.waiting_for_prompt)
+async def process_generation(message: types.Message, state: FSMContext):
+    if not message.text:
+        await message.answer("❌ Напишите описание текстом.")
         return
-    if not command.args:
-        await message.answer(
-            "Формат: <code>/addpromo КОД НАГРАДА АКТИВАЦИИ</code>\n"
-            "Пример: <code>/addpromo BONUS5 5 50</code>",
-            parse_mode="HTML"
-        )
+
+    data = await state.get_data()
+    pack_size = data.get("pack_size", 1)
+    pack_price = data.get("pack_price", 1)
+    photo_id = data.get("photo_id")
+
+    if not photo_id:
+        await message.answer("❌ Фото не найдено. Начните заново.")
+        await state.clear()
         return
+
+    # Списываем генерации
+    if not try_deduct_balance(message.from_user.id, pack_price):
+        await message.answer("❌ Закончились генерации! Пополните баланс в «💎 Тарифы».")
+        await state.clear()
+        return
+
+    wait_msg = await message.answer(f"⏳ Создаю {pack_size} карточек. Это займёт 20-40 секунд...")
+    
     try:
-        parts = command.args.split()
-        if len(parts) != 3:
-            raise ValueError("нужно 3 аргумента")
-        code, reward, uses = parts[0].upper(), int(parts[1]), int(parts[2])
-        if reward <= 0 or uses <= 0:
-            await message.answer("❌ Награда и активации должны быть > 0!")
-            return
+        # Скачиваем фото
+        file_info = await bot.get_file(photo_id)
+        photo_bytes = BytesIO()
+        await bot.download_file(file_info.file_path, photo_bytes)
+        photo_bytes.seek(0)
+
+        # Вырезаем объект
+        try:
+            # rembg работает синхронно, лучше вынести в поток, но для простоты оставим тут
+            input_img = Image.open(photo_bytes)
+            output_img = remove(input_img)
+            
+            # Сохраняем результат в BytesIO
+            img_byte_arr = BytesIO()
+            output_img.save(img_byte_arr, format='PNG')
+            img_byte_arr.seek(0)
+            object_bytes = img_byte_arr.getvalue()
+        except Exception as e:
+            logger.error(f"Ошибка rembg: {e}")
+            # Fallback: если rembg упал, шлем оригинал (для теста, чтобы бот не падал)
+            object_bytes = photo_bytes.getvalue()
+
+        # Генерируем фоны
+        backgrounds = []
+        user_prompt = message.text.strip()[:400]
+        
+        headers = {"Authorization": f"Bearer {AI_API_KEY}"}
+        timeout = aiohttp.ClientTimeout(total=180)
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for i in range(pack_size):
+                # Меняем промпт для разнообразия ракурсов
+                angle_prompts = [
+                    "Главный кадр. Товар по центру.",
+                    "Ракурс 3/4, виден объем товара.",
+                    "Товар в интерьере, лайфстайл.",
+                    "Вид сверху (флэтлей) с небольшим декором.",
+                    "Крупный план детали товара."
+                ]
+                prompt = f"Коммерческая карточка для маркетплейса. {user_prompt}. {angle_prompts[i % len(angle_prompts)]}. Без текста и логотипов."
+                
+                payload = {
+                    "model": MODEL,
+                    "prompt": prompt,
+                    "size": "1024x1536",
+                    "quality": "medium",
+                    "n": 1
+                }
+                
+                async with session.post(f"{PROXYAPI_URL}/images/generations", json=payload, headers=headers) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        raise RuntimeError(f"API {resp.status}: {err[:200]}")
+                    res_json = await resp.json()
+                
+                b64_img = res_json["data"][0]["b64_json"]
+                bg_bytes = base64.b64decode(b64_img)
+                
+                # Накладываем вырезанный объект на сгенерированный фон
+                bg_img = Image.open(BytesIO(bg_bytes)).convert("RGBA")
+                fg_img = Image.open(BytesIO(object_bytes)).convert("RGBA")
+                
+                # Масштабируем объект (примерно 50% от фона)
+                fg_width = int(bg_img.width * 0.5)
+                fg_height = int(fg_img.height * (fg_width / fg_img.width))
+                fg_img = fg_img.resize((fg_width, fg_height), Image.Resampling.LANCZOS)
+                
+                # Позиционируем по центру
+                x = (bg_img.width - fg_width) // 2
+                y = (bg_img.height - fg_height) // 2
+                
+                # Накладываем
+                bg_img.paste(fg_img, (x, y), fg_img)
+                
+                # Сохраняем в буфер
+                final_io = BytesIO()
+                bg_img.convert("RGB").save(final_io, format="JPEG", quality=95)
+                final_io.seek(0)
+                backgrounds.append(final_io)
+
+        # Отправляем альбомом
+        media_group = []
+        for i, bg in enumerate(backgrounds):
+            media_group.append(types.InputMediaPhoto(media=BufferedInputFile(bg.read(), filename=f"card_{i+1}.jpg")))
+
+        sent_messages = await message.answer_media_group(media_group)
+        
+        # Сохраняем в БД
+        pack_id = str(uuid.uuid4())[:8]
+        file_ids = ",".join([m.photo[-1].file_id for m in sent_messages])
         cursor.execute(
-            "INSERT OR REPLACE INTO promocodes (code, reward, uses_left) VALUES (?, ?, ?)",
-            (code, reward, uses)
+            "INSERT INTO packs (pack_id, user_id, size, category, style, file_ids) VALUES (?, ?, ?, ?, ?, ?)",
+            (pack_id, message.from_user.id, pack_size, "custom", user_prompt, file_ids)
         )
         conn.commit()
+
+        # Кнопки под результатом
+        result_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Переделать", callback_data=f"redo:{pack_id}")],
+            [InlineKeyboardButton(text="📦 Собрать ZIP", callback_data=f"zip:{pack_id}")],
+            [InlineKeyboardButton(text="➕ Создать ещё", callback_data="create_more")]
+        ])
+        
         await message.answer(
-            f"✅ Код <code>{code}</code> создан (+{reward} ген., {uses} акт.)",
+            f"✨ <b>Пак готов!</b>\n"
+            f"📦 Карточек: {pack_size}\n"
+            f"💳 Списано: {pack_price} генераций\n"
+            f"📝 <i>{html.escape(user_prompt[:100])}...</i>",
+            reply_markup=result_kb,
             parse_mode="HTML"
         )
+        await wait_msg.delete()
+
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {html.escape(str(e))}", parse_mode="HTML")
-
-
-@dp.message(Command("addbalance"))
-async def add_balance_cmd(message: types.Message, command: CommandObject):
-    if message.from_user.id != ADMIN_ID or not command.args:
-        return
-    try:
-        raw_id, raw_amount = command.args.split()
-        target_id, amount = int(raw_id), int(raw_amount)
-        ensure_user(target_id)
-        change_balance(target_id, amount)
-        await message.answer(
-            f"✅ Пользователю <code>{target_id}</code> начислено {amount} ген.",
-            parse_mode="HTML"
-        )
+        logger.exception("Ошибка генерации")
+        refund_balance(message.from_user.id, pack_price)
         try:
-            await bot.send_message(
-                target_id,
-                f"⚡ Администратор начислил вам <b>+{amount} генераций</b>!",
-                parse_mode="HTML"
-            )
+            await wait_msg.edit_text("❌ Ошибка при генерации. Генерации возвращены на баланс. Попробуйте позже.")
         except Exception:
-            pass
-    except Exception as e:
-        await message.answer(
-            f"❌ Формат: <code>/addbalance USER_ID КОЛИЧЕСТВО</code>\nОшибка: {html.escape(str(e))}",
-            parse_mode="HTML"
-        )
+            await message.answer("❌ Ошибка при генерации. Генерации возвращены на баланс.")
+    finally:
+        await state.clear()
 
-
-# ============ ОТВЕТ АДМИНА В ПОДДЕРЖКУ ============
-async def is_support_reply(message: types.Message) -> bool:
-    """Фильтр: сообщение от админа, являющееся Reply на тикет поддержки."""
-    if message.from_user.id != ADMIN_ID:
-        return False
-    if not message.reply_to_message:
-        return False
-    cursor.execute(
-        "SELECT 1 FROM support_tickets WHERE admin_msg_id = ?",
-        (message.reply_to_message.message_id,)
-    )
-    return cursor.fetchone() is not None
-
-
-@dp.message(is_support_reply)
-async def support_admin_reply(message: types.Message):
-    cursor.execute(
-        "SELECT user_id FROM support_tickets WHERE admin_msg_id = ?",
-        (message.reply_to_message.message_id,)
-    )
+# ============ ZIP И ПЕРЕДЕЛКА ============
+@dp.callback_query(F.data.startswith("zip:"))
+async def send_zip(cb: types.CallbackQuery):
+    await cb.answer()
+    pack_id = cb.data.split(":")[1]
+    cursor.execute("SELECT file_ids FROM packs WHERE pack_id = ? AND user_id = ?", (pack_id, cb.from_user.id))
     row = cursor.fetchone()
     if not row:
+        await cb.message.answer("❌ Пак не найден.")
         return
-    user_id = row[0]
-    try:
-        await message.copy_to(user_id)
-        await message.reply("✅ Ответ отправлен пользователю.")
-    except Exception as e:
-        logger.exception("Ошибка отправки ответа пользователю")
-        await message.reply(f"❌ Не удалось отправить: {html.escape(str(e))}")
+    
+    file_ids = row[0].split(",")
+    zip_buffer = io.BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, "w") as zf:
+        for i, fid in enumerate(file_ids):
+            try:
+                file_info = await bot.get_file(fid)
+                file_bytes = BytesIO()
+                await bot.download_file(file_info.file_path, file_bytes)
+                zf.writestr(f"card_{i+1}.jpg", file_bytes.getvalue())
+            except Exception as e:
+                logger.error(f"Ошибка скачивания для ZIP: {e}")
+    
+    zip_buffer.seek(0)
+    await cb.message.answer_document(
+        BufferedInputFile(zip_buffer.read(), filename=f"viso_pack_{pack_id}.zip"),
+        caption="📦 Ваш архив с карточками готов!"
+    )
 
+@dp.callback_query(F.data.startswith("redo:"))
+async def process_redo(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    pack_id = cb.data.split(":")[1]
+    
+    cursor.execute("SELECT redo_used, size FROM packs WHERE pack_id = ? AND user_id = ?", (pack_id, cb.from_user.id))
+    row = cursor.fetchone()
+    if not row:
+        await cb.message.answer("❌ Пак не найден.")
+        return
+    
+    redo_used, size = row
+    user = ensure_user(cb.from_user.id)
+    
+    if redo_used < FREE_REDO_PER_PACK:
+        # Бесплатно
+        cursor.execute("UPDATE packs SET redo_used = redo_used + 1 WHERE pack_id = ?", (pack_id,))
+        conn.commit()
+        await cb.message.answer("🔄 Первая переделка бесплатна. Загрузите новое фото или описание заново.")
+    else:
+        # Платно
+        if user[0] < PRICE_REDO:
+            await cb.message.answer("❌ Недостаточно генераций для переделки. Нужно: 1.")
+            return
+        try_deduct_balance(cb.from_user.id, PRICE_REDO)
+        cursor.execute("UPDATE packs SET redo_used = redo_used + 1 WHERE pack_id = ?", (pack_id,))
+        conn.commit()
+        await cb.message.answer("🔄 Списан 1 генерация. Загрузите фото и описание заново.")
+    
+    # Запускаем процесс заново
+    await state.update_data(pack_size=size, pack_price=1) # price 1, так как уже списали
+    await state.set_state(BotStates.waiting_for_photo)
+    await cb.message.answer("📸 Загрузите фото товара:")
 
-# ============ КНОПКИ ГЛАВНОГО МЕНЮ ============
+@dp.callback_query(F.data == "create_more")
+async def create_more(cb: types.CallbackQuery):
+    await cb.answer()
+    await cb.message.answer("Выберите размер нового пака:", reply_markup=get_pack_kb())
+
+# ============ ПРОФИЛЬ И ТАРИФЫ ============
 @dp.message(F.text == "👤 Мой профиль")
 async def profile_handler(message: types.Message, state: FSMContext):
     await state.clear()
-    balance, refs = ensure_user(message.from_user.id)
+    balance, refs, _ = ensure_user(message.from_user.id)
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={message.from_user.id}"
     await message.answer(
-        f"👤 <b>Кабинет продавца</b>\n\n"
-        f"🆔 Ваш ID: <code>{message.from_user.id}</code>\n"
-        f"⚡ Доступно генераций: <b>{balance} шт.</b>\n"
+        f"👤 <b>Кабинет дизайнера</b>\n\n"
+        f"🆔 ID: <code>{message.from_user.id}</code>\n"
+        f"⚡ Баланс: <b>{balance} генераций</b> (карточек)\n"
         f"👥 Приглашено друзей: <b>{refs}</b>\n\n"
-        f"🎁 <b>Партнёрская ссылка (+1 генерация за друга):</b>\n<code>{ref_link}</code>",
+        f"🎁 <b>Партнёрская ссылка:</b>\n<code>{ref_link}</code>",
         parse_mode="HTML"
     )
-
 
 @dp.message(F.text == "💎 Тарифы")
 async def price_handler(message: types.Message, state: FSMContext):
     await state.clear()
-    pay_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="10 генераций — 390 ₽",   callback_data="buy_10")],
-        [InlineKeyboardButton(text="🔥 30 генераций — 990 ₽", callback_data="buy_30")],
-        [InlineKeyboardButton(text="100 генераций — 2 490 ₽", callback_data="buy_100")]
-    ])
     await message.answer(
         "💎 <b>Тарифы VISO AI</b>\n\n"
-        "• <b>10 генераций</b> — 390 ₽ (39 ₽/шт.)\n"
-        "• <b>30 генераций</b> — 990 ₽ (33 ₽/шт.)\n"
-        "• <b>100 генераций</b> — 2 490 ₽ (25 ₽/шт.)\n\n"
-        "<i>Оплачивая тариф, вы соглашаетесь с правилами (раздел «🆘 Помощь и Правила»).</i>",
-        reply_markup=pay_kb,
+        "⚡ 1 генерация = 1 карточка\n\n"
+        "• 10 генераций — 390 ₽\n"
+        "• 30 генераций — 990 ₽ (выгоднее)\n"
+        "• 100 генераций — 2490 ₽ (максимум)\n\n"
+        "🎁 <b>Скидки на паки:</b>\n"
+        "• Пак 3 карточки = 2 генерации\n"
+        "• Пак 5 карточек = 4 генерации\n\n"
+        "<i>Оплата скоро будет подключена. Пока используйте промокоды.</i>",
         parse_mode="HTML"
     )
-
 
 @dp.message(F.text == "🎁 Пригласить друга")
 async def referral_handler(message: types.Message, state: FSMContext):
@@ -333,124 +540,18 @@ async def referral_handler(message: types.Message, state: FSMContext):
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={message.from_user.id}"
     await message.answer(
-        f"🎁 За каждого друга по вашей ссылке вы получите <b>+1 генерацию</b>!\n\n"
-        f"🔗 Ваша ссылка (нажмите, чтобы скопировать):\n<code>{ref_link}</code>",
+        f"🎁 За каждого друга вы получите <b>+1 генерацию</b>!\n\n"
+        f"🔗 <code>{ref_link}</code>",
         parse_mode="HTML"
     )
 
-
+# ============ ПРОМОКОД ============
 @dp.message(F.text == "🎟 Бонус-код")
 async def promo_start(message: types.Message, state: FSMContext):
     await state.clear()
-    ensure_user(message.from_user.id)
     await state.set_state(BotStates.waiting_for_promo)
     await message.answer("🎟 Введите ваш бонус-код:")
 
-
-@dp.message(F.text == "🆘 Помощь и Правила")
-async def help_handler(message: types.Message, state: FSMContext):
-    await state.clear()
-    help_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📖 Примеры запросов",    callback_data="help_examples")],
-        [InlineKeyboardButton(text="📜 Правила и возвраты",   callback_data="help_terms")],
-        [InlineKeyboardButton(text="💬 Написать в поддержку", callback_data="help_support")]
-    ])
-    await message.answer(
-        "🆘 <b>Как получить идеальную карточку:</b>\n\n"
-        "1️⃣ <b>Фото:</b> снимайте товар при хорошем свете, чтобы этикетка читалась.\n"
-        "2️⃣ <b>Описание:</b> пишите конкретно, где стоит товар, какой фон и свет.\n"
-        "3️⃣ <b>Инфографика:</b> добавьте в запрос <i>«товар сдвинут вправо, слева место для текста»</i>.\n\n"
-        "Выберите раздел ниже 👇",
-        reply_markup=help_kb,
-        parse_mode="HTML"
-    )
-
-
-@dp.message(F.text == "📦 Карточка товара")
-async def edit_photo_start(message: types.Message, state: FSMContext):
-    await state.clear()
-    balance, _ = ensure_user(message.from_user.id)
-    if balance <= 0:
-        await message.answer("❌ Закончились генерации! Пополните баланс в разделе «💎 Тарифы».")
-        return
-    await state.set_state(BotStates.waiting_for_photo)
-    await message.answer("📸 <b>Шаг 1 из 2:</b> Отправьте фото вашего товара:", parse_mode="HTML")
-
-
-@dp.message(F.text == "🎨 Создать картинку")
-async def create_image_start(message: types.Message, state: FSMContext):
-    await state.clear()
-    balance, _ = ensure_user(message.from_user.id)
-    if balance <= 0:
-        await message.answer("❌ Закончились генерации! Пополните баланс в разделе «💎 Тарифы».")
-        return
-    await state.set_state(BotStates.waiting_for_prompt)
-    await message.answer(
-        "✍️ <b>Опишите на русском, что нужно нарисовать:</b>",
-        parse_mode="HTML"
-    )
-
-
-# ============ CALLBACK ============
-@dp.callback_query(F.data.startswith("buy_"))
-async def process_buy(callback: types.CallbackQuery):
-    _, pack = callback.data.split("_", 1)
-    await callback.answer()
-    await callback.message.answer(
-        f"💳 Выбран пакет на <b>{html.escape(pack)} генераций</b>.\n"
-        f"Автоматическая оплата скоро будет подключена.\n"
-        f"Для ручного пополнения напишите в поддержку через раздел «🆘 Помощь».",
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(F.data == "help_examples")
-async def help_examples_cb(callback: types.CallbackQuery):
-    await callback.answer()
-    await callback.message.answer(
-        "📖 <b>Готовые шаблоны (нажмите, чтобы скопировать):</b>\n\n"
-        "⬜ <b>Минимализм для косметики:</b>\n"
-        "<code>Товар на светлом бетонном подиуме, мягкий утренний свет, лёгкие тени, фон размыт, слева место под текст</code>\n\n"
-        "🌿 <b>Эко-стиль для дома и кухни:</b>\n"
-        "<code>Товар на деревянной столешнице, уютная светлая кухня на фоне, тёплый студийный свет, коммерческая съёмка</code>\n\n"
-        "💎 <b>Премиум для электроники:</b>\n"
-        "<code>Товар на тёмном матовом камне, контровой холодный свет, глубокие тени, рекламная съёмка</code>",
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(F.data == "help_terms")
-async def help_terms_cb(callback: types.CallbackQuery):
-    await callback.answer()
-    await callback.message.answer(
-        "📜 <b>Правила и возвраты (Оферта VISO AI):</b>\n\n"
-        "1. <b>Предмет:</b> доступ к алгоритмам ИИ для генерации изображений «как есть».\n"
-        "2. <b>Результат:</b> качество зависит от фото и описания. Артефакты не являются сбоем.\n"
-        "3. <b>Права:</b> пользователь гарантирует наличие прав на загружаемые фото.\n"
-        "4. <b>Возврат:</b>\n"
-        "• Сбой сервера — попытка не списывается.\n"
-        "• Возврат средств — только за неиспользованный остаток пакета.\n"
-        "• Использованные генерации возврату не подлежат.",
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(F.data == "help_support")
-async def help_support_cb(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if not ADMIN_ID:
-        await callback.message.answer("❌ Поддержка временно недоступна.")
-        return
-    await state.set_state(BotStates.waiting_for_support)
-    await callback.message.answer(
-        "💬 <b>Чат с поддержкой</b>\n\n"
-        "Опишите проблему одним сообщением (можно со скриншотом). "
-        "Оператор ответит сюда. Для выхода — /cancel.",
-        parse_mode="HTML"
-    )
-
-
-# ============ FSM: ПРОМОКОД ============
 @dp.message(BotStates.waiting_for_promo)
 async def promo_process(message: types.Message, state: FSMContext):
     if not message.text:
@@ -483,199 +584,141 @@ async def promo_process(message: types.Message, state: FSMContext):
     change_balance(user_id, reward)
     conn.commit()
 
-    await message.answer(
-        f"🎉 Код <b>{html.escape(code)}</b> активирован! Начислено: <b>+{reward} генераций</b>.",
-        parse_mode="HTML"
-    )
+    await message.answer(f"🎉 Код <b>{html.escape(code)}</b> активирован! Начислено: <b>+{reward} генераций</b>.", parse_mode="HTML")
     await state.clear()
 
+# ============ ПОМОЩЬ И ПОДДЕРЖКА ============
+@dp.message(F.text == "🆘 Помощь и Правила")
+async def help_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    help_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📖 Примеры запросов", callback_data="help_examples")],
+        [InlineKeyboardButton(text="📜 Правила и возвраты", callback_data="help_terms")],
+        [InlineKeyboardButton(text="💬 Написать в поддержку", callback_data="help_support")]
+    ])
+    await message.answer("🆘 <b>Раздел помощи</b>\nВыберите нужный пункт 👇", reply_markup=help_kb, parse_mode="HTML")
 
-# ============ FSM: КАРТОЧКА ТОВАРА 3:4 ============
-@dp.message(BotStates.waiting_for_photo, F.photo)
-async def edit_photo_get_image(message: types.Message, state: FSMContext):
-    await state.update_data(photo_id=message.photo[-1].file_id)
-    await state.set_state(BotStates.waiting_for_edit_prompt)
-    await message.answer(
-        "✍️ <b>Шаг 2 из 2:</b> Опишите фон и сцену.\n"
-        "<i>Например: «на светлом мраморном подиуме, мягкий утренний свет, справа место под текст»</i>",
+@dp.callback_query(F.data == "help_examples")
+async def help_examples_cb(cb: types.CallbackQuery):
+    await cb.answer()
+    await cb.message.answer(
+        "📖 <b>Примеры запросов:</b>\n\n"
+        "⬜ <b>Минимализм:</b>\n"
+        "<code>Товар на светлом бетонном подиуме, мягкий утренний свет, слева место под текст</code>\n\n"
+        "🌿 <b>Эко:</b>\n"
+        "<code>Товар на деревянной столешнице, уютная светлая кухня на фоне, тёплый студийный свет</code>\n\n"
+        "💎 <b>Премиум:</b>\n"
+        "<code>Товар на тёмном матовом камне, контровой холодный свет, рекламная съёмка</code>",
         parse_mode="HTML"
     )
 
-
-@dp.message(BotStates.waiting_for_photo, ~F.photo)
-async def edit_photo_wrong(message: types.Message):
-    await message.answer("❌ Отправьте именно <b>фотографию</b> (не файлом).", parse_mode="HTML")
-
-
-@dp.message(BotStates.waiting_for_edit_prompt)
-async def edit_photo_process(message: types.Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ Опишите фон текстом.")
-        return
-
-    data = await state.get_data()
-    photo_id = data.get("photo_id")
-    if not photo_id:
-        await message.answer("❌ Фото потеряно. Начните заново — «📦 Карточка товара».")
-        await state.clear()
-        return
-
-    # атомарное списание
-    if not try_deduct_balance(message.from_user.id):
-        await message.answer("❌ Закончились генерации! Пополните баланс в «💎 Тарифы».")
-        await state.clear()
-        return
-
-    user_scene = message.text.strip()[:500]
-    full_prompt = (
-        f"Коммерческая карточка товара для маркетплейса. Сохрани сам товар, его форму, цвет, "
-        f"логотипы и текст на этикетке полностью без изменений. Замени только фон и освещение: {user_scene}. "
-        f"Профессиональная предметная студийная съёмка, реалистичные тени, высокая детализация."
+@dp.callback_query(F.data == "help_terms")
+async def help_terms_cb(cb: types.CallbackQuery):
+    await cb.answer()
+    await cb.message.answer(
+        "📜 <b>Правила и возвраты:</b>\n\n"
+        "1. <b>Предмет:</b> доступ к ИИ для генерации изображений.\n"
+        "2. <b>Результат:</b> качество зависит от фото и описания.\n"
+        "3. <b>Права:</b> пользователь гарантирует наличие прав на загружаемые фото.\n"
+        "4. <b>Возврат:</b>\n"
+        "• Сбой сервера — генерации не списываются (возвращаются автоматически).\n"
+        "• Возврат средств — только за неиспользованный остаток.\n"
+        "• Использованные генерации возврату не подлежат.",
+        parse_mode="HTML"
     )
 
-    wait_msg = await message.answer("⏳ Создаю карточку 3:4 (15–25 сек)...")
-    success = False
-    try:
-        file_info = await bot.get_file(photo_id)
-        photo_io = BytesIO()
-        await bot.download_file(file_info.file_path, photo_io)
-        photo_io.seek(0)
-
-        form = aiohttp.FormData()
-        form.add_field("model", MODEL)
-        form.add_field("prompt", full_prompt)
-        form.add_field("size", "1024x1536")
-        form.add_field("quality", "medium")
-        form.add_field("image", photo_io, filename="image.jpg", content_type="image/jpeg")
-
-        headers = {"Authorization": f"Bearer {AI_API_KEY}"}
-        timeout = aiohttp.ClientTimeout(total=120)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{PROXYAPI_URL}/images/edits", data=form, headers=headers) as resp:
-                if resp.status != 200:
-                    err_text = await resp.text()
-                    raise RuntimeError(f"API {resp.status}: {err_text[:300]}")
-                result = await resp.json()
-
-        (first_item,) = result["data"]
-        result_bytes = base64.b64decode(first_item["b64_json"])
-        await message.answer_photo(
-            BufferedInputFile(result_bytes, filename="card_3x4.png"),
-            caption=f"✨ <b>Карточка готова (3:4)!</b>\n📝 <i>{html.escape(user_scene)}</i>",
-            parse_mode="HTML"
-        )
-        success = True
-    except Exception:
-        logger.exception("Ошибка создания карточки")
-    finally:
-        if not success:
-            refund_balance(message.from_user.id)
-        try:
-            await wait_msg.delete()
-        except Exception:
-            pass
-        await state.clear()
-
-
-# ============ FSM: СОЗДАТЬ КАРТИНКУ ============
-@dp.message(BotStates.waiting_for_prompt)
-async def create_image_process(message: types.Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ Опишите картинку текстом.")
-        return
-
-    if not try_deduct_balance(message.from_user.id):
-        await message.answer("❌ Закончились генерации! Пополните баланс в «💎 Тарифы».")
-        await state.clear()
-        return
-
-    prompt_text = message.text.strip()[:500]
-    wait_msg = await message.answer("⏳ Рисую (15–20 сек)...")
-    success = False
-    try:
-        headers = {
-            "Authorization": f"Bearer {AI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": MODEL,
-            "prompt": prompt_text,
-            "size": "1024x1536",
-            "quality": "medium",
-            "n": 1
-        }
-        timeout = aiohttp.ClientTimeout(total=120)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{PROXYAPI_URL}/images/generations", json=payload, headers=headers) as resp:
-                if resp.status != 200:
-                    err_text = await resp.text()
-                    raise RuntimeError(f"API {resp.status}: {err_text[:300]}")
-                result = await resp.json()
-
-        (first_item,) = result["data"]
-        image_bytes = base64.b64decode(first_item["b64_json"])
-        await message.answer_photo(
-            BufferedInputFile(image_bytes, filename="image.png"),
-            caption=f"✨ <b>Готово!</b>\n📝 <i>{html.escape(prompt_text)}</i>",
-            parse_mode="HTML"
-        )
-        success = True
-    except Exception:
-        logger.exception("Ошибка генерации")
-    finally:
-        if not success:
-            refund_balance(message.from_user.id)
-        try:
-            await wait_msg.delete()
-        except Exception:
-            pass
-        await state.clear()
-
-
-# ============ FSM: ПОДДЕРЖКА ============
-@dp.message(BotStates.waiting_for_support)
-async def support_receive_from_user(message: types.Message, state: FSMContext):
+@dp.callback_query(F.data == "help_support")
+async def help_support_cb(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
     if not ADMIN_ID:
-        await message.answer("❌ Поддержка временно недоступна.")
+        await cb.message.answer("❌ Поддержка временно недоступна.")
+        return
+    await state.set_state(BotStates.waiting_for_support)
+    await cb.message.answer("💬 <b>Напишите ваш вопрос поддержке:</b>", parse_mode="HTML")
+
+@dp.message(BotStates.waiting_for_support)
+async def support_receive(message: types.Message, state: FSMContext):
+    if not ADMIN_ID:
+        await message.answer("❌ Поддержка недоступна.")
         await state.clear()
         return
 
     user_info = f"@{message.from_user.username}" if message.from_user.username else "без юзернейма"
     header = (
-        f"📩 <b>Новое обращение в поддержку</b>\n"
+        f"📩 <b>Обращение в поддержку</b>\n"
         f"👤 От: {html.escape(message.from_user.full_name)} ({user_info})\n"
         f"🆔 ID: <code>{message.from_user.id}</code>\n"
-        f"<i>Ответьте на это сообщение (Reply), чтобы написать клиенту</i>"
+        f"<i>Ответьте на это сообщение (Reply)</i>"
     )
-
     try:
         admin_msg = await bot.send_message(ADMIN_ID, header, parse_mode="HTML")
         await message.forward(ADMIN_ID)
-        cursor.execute(
-            "INSERT OR REPLACE INTO support_tickets (admin_msg_id, user_id) VALUES (?, ?)",
-            (admin_msg.message_id, message.from_user.id)
-        )
+        cursor.execute("INSERT OR REPLACE INTO support_tickets (admin_msg_id, user_id) VALUES (?, ?)", (admin_msg.message_id, message.from_user.id))
         conn.commit()
-        await message.answer(
-            "✅ Передано в поддержку. Ответ придёт сюда.\n"
-            "Можете отправить ещё сообщение или /cancel для выхода."
-        )
+        await message.answer("✅ Передано в поддержку. Ответ придёт сюда. Для выхода — /cancel.")
     except Exception:
-        logger.exception("Ошибка пересылки в поддержку")
-        await message.answer("❌ Не удалось отправить. Попробуйте позже.")
+        await message.answer("❌ Не удалось отправить.")
 
+# ============ АДМИНКА ============
+@dp.message(Command("addpromo"))
+async def add_promo_cmd(message: types.Message, command: CommandObject):
+    if message.from_user.id != ADMIN_ID: return
+    if not command.args:
+        await message.answer("Формат: <code>/addpromo КОД НАГРАДА АКТИВАЦИИ</code>", parse_mode="HTML")
+        return
+    try:
+        parts = command.args.split()
+        if len(parts) != 3: raise ValueError
+        code, reward, uses = parts[0].upper(), int(parts[1]), int(parts[2])
+        if reward <= 0 or uses <= 0: raise ValueError
+        cursor.execute("INSERT OR REPLACE INTO promocodes (code, reward, uses_left) VALUES (?, ?, ?)", (code, reward, uses))
+        conn.commit()
+        await message.answer(f"✅ Код <code>{code}</code> создан (+{reward} ген., {uses} акт.)", parse_mode="HTML")
+    except Exception:
+        await message.answer("❌ Ошибка формата.")
+
+@dp.message(Command("addbalance"))
+async def add_balance_cmd(message: types.Message, command: CommandObject):
+    if message.from_user.id != ADMIN_ID or not command.args: return
+    try:
+        raw_id, raw_amount = command.args.split()
+        target_id, amount = int(raw_id), int(raw_amount)
+        ensure_user(target_id)
+        change_balance(target_id, amount)
+        await message.answer(f"✅ Начислено {amount} ген. пользователю {target_id}.")
+        try: await bot.send_message(target_id, f"⚡ Администратор начислил вам <b>+{amount} генераций</b>!", parse_mode="HTML")
+        except Exception: pass
+    except Exception:
+        await message.answer("❌ Формат: <code>/addbalance USER_ID КОЛИЧЕСТВО</code>", parse_mode="HTML")
+
+@dp.message(Command("cancel"))
+async def cancel_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Действие отменено.", reply_markup=main_kb)
+
+# --- ОТВЕТ АДМИНА В ПОДДЕРЖКУ ---
+async def is_support_reply(message: types.Message) -> bool:
+    if message.from_user.id != ADMIN_ID or not message.reply_to_message: return False
+    cursor.execute("SELECT 1 FROM support_tickets WHERE admin_msg_id = ?", (message.reply_to_message.message_id,))
+    return cursor.fetchone() is not None
+
+@dp.message(is_support_reply)
+async def support_admin_reply(message: types.Message):
+    cursor.execute("SELECT user_id FROM support_tickets WHERE admin_msg_id = ?", (message.reply_to_message.message_id,))
+    row = cursor.fetchone()
+    if not row: return
+    try:
+        await message.copy_to(row[0])
+        await message.reply("✅ Ответ отправлен.")
+    except Exception:
+        await message.reply("❌ Ошибка отправки.")
 
 # ============ ЗАПУСК ============
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     logger.info(f"✅ Бот @{me.username} запущен!")
-    if ADMIN_ID:
-        logger.info(f"👑 Admin ID: {ADMIN_ID}")
-    else:
-        logger.warning("⚠️ ADMIN_ID не задан — админ-функции и поддержка отключены")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
