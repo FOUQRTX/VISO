@@ -36,18 +36,15 @@ TOKEN = os.getenv("BOT_TOKEN")
 AI_API_KEY = os.getenv("AI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID") or "0")
 
-if not TOKEN:
-    logger.error("❌ Не задан BOT_TOKEN!")
-    sys.exit(1)
-if not AI_API_KEY:
-    logger.error("❌ Не задан AI_API_KEY!")
+if not TOKEN or not AI_API_KEY:
+    logger.error("❌ Не заданы BOT_TOKEN или AI_API_KEY!")
     sys.exit(1)
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 PROXYAPI_URL = "https://api.proxyapi.ru/openai/v1"
-MODEL = "gpt-image-1.5"  # Если не работает, замените на "gpt-image-1"
+MODEL = "gpt-image-1.5"  # Если будет ошибка API, поменяй на "gpt-image-1"
 FREE_GENERATIONS = 3
 
 # ============ ЦЕНЫ ============
@@ -68,6 +65,7 @@ except Exception:
 conn = sqlite3.connect(DATA_DIR / "users.db", check_same_thread=False)
 cursor = conn.cursor()
 
+# Создаем таблицы
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
@@ -109,6 +107,24 @@ cursor.execute("""
     )
 """)
 conn.commit()
+
+# ============ АВТОМАТИЧЕСКАЯ МИГРАЦИЯ БД ============
+# Это защитит от ошибки "no such column: onboarded", если база старая
+def check_db_columns():
+    cursor.execute("PRAGMA table_info(users)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if "onboarded" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN onboarded INTEGER DEFAULT 0")
+        logger.info("🔧 Миграция БД: добавлена колонка onboarded")
+    if "referrals" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN referrals INTEGER DEFAULT 0")
+        logger.info("🔧 Миграция БД: добавлена колонка referrals")
+    if "balance" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 3")
+        logger.info("🔧 Миграция БД: добавлена колонка balance")
+    conn.commit()
+
+check_db_columns()
 
 # ============ ХЕЛПЕРЫ БД ============
 def get_user(user_id: int):
@@ -161,7 +177,6 @@ def set_onboarded(user_id: int):
 class BotStates(StatesGroup):
     waiting_for_prompt = State()
     waiting_for_photo = State()
-    waiting_for_edit_prompt = State()
     waiting_for_promo = State()
     waiting_for_support = State()
 
@@ -179,11 +194,10 @@ def get_pack_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="1 карточка — 1 генерация", callback_data="pack:1")],
         [InlineKeyboardButton(text="3 карточки — 2 генерации (выгода)", callback_data="pack:3")],
-        [InlineKeyboardButton(text="5 карточек — 4 генерации (макс. выгода)", callback_data="pack:5")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
+        [InlineKeyboardButton(text="5 карточек — 4 генерации (макс. выгода)", callback_data="pack:5")]
     ])
 
-# ============ /START ============
+# ============ /START И ТУР ============
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandObject, state: FSMContext):
     await state.clear()
@@ -222,15 +236,32 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
 async def start_tour(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     set_onboarded(cb.from_user.id)
-    await cb.message.edit_text("🎨 <b>Шаг 1 из 2:</b> Нажмите «🎨 Создать пак» в меню ниже и загрузите фото.", reply_markup=main_kb, parse_mode="HTML")
+    # ИСПРАВЛЕНИЕ: Удаляем старое сообщение и отправляем новое, чтобы повесить Reply-кнопки
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await cb.message.answer(
+        "🎨 <b>Шаг 1 из 2:</b> Нажмите «🎨 Создать пак» в меню ниже и загрузите фото.",
+        reply_markup=main_kb,
+        parse_mode="HTML"
+    )
 
 @dp.callback_query(F.data == "skip_tour")
 async def skip_tour(cb: types.CallbackQuery):
     await cb.answer()
     set_onboarded(cb.from_user.id)
-    await cb.message.edit_text("👌 Ок! Вы всегда можете вернуться к инструкции в разделе «🆘 Помощь».", reply_markup=main_kb)
+    # ИСПРАВЛЕНИЕ: Удаляем старое сообщение и отправляем новое
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await cb.message.answer(
+        "👌 Ок! Вы всегда можете вернуться к инструкции в разделе «🆘 Помощь».",
+        reply_markup=main_kb
+    )
 
-# ============ ОСНОВНЫЕ ХЕНДЛЕРЫ ============
+# ============ СОЗДАНИЕ ПАКА ============
 @dp.message(F.text == "🎨 Создать пак")
 async def create_pack_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -273,6 +304,7 @@ async def process_photo(message: types.Message, state: FSMContext):
 async def wrong_photo(message: types.Message):
     await message.answer("❌ Отправьте именно <b>фотографию</b> (не файлом).", parse_mode="HTML")
 
+# ============ ГЕНЕРАЦИЯ ============
 @dp.message(BotStates.waiting_for_prompt)
 async def process_generation(message: types.Message, state: FSMContext):
     if not message.text:
@@ -297,6 +329,7 @@ async def process_generation(message: types.Message, state: FSMContext):
     wait_msg = await message.answer(f"⏳ Создаю {pack_size} карточек. Это займёт 20-40 секунд...")
     
     try:
+        # Скачиваем фото пользователя
         file_info = await bot.get_file(photo_id)
         photo_bytes = BytesIO()
         await bot.download_file(file_info.file_path, photo_bytes)
@@ -444,11 +477,6 @@ async def process_redo(cb: types.CallbackQuery, state: FSMContext):
 async def create_more(cb: types.CallbackQuery):
     await cb.answer()
     await cb.message.answer("Выберите размер нового пака:", reply_markup=get_pack_kb())
-
-@dp.callback_query(F.data == "back_to_menu")
-async def back_to_menu(cb: types.CallbackQuery):
-    await cb.answer()
-    await cb.message.delete()
 
 # ============ ПРОФИЛЬ И ТАРИФЫ ============
 @dp.message(F.text == "👤 Мой профиль")
