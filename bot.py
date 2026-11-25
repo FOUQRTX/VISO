@@ -44,7 +44,7 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 PROXYAPI_URL = "https://api.proxyapi.ru/openai/v1"
-MODEL = "gpt-image-1.5"  # Если будет ошибка API, поменяй на "gpt-image-1"
+MODEL = "gpt-image-1.5"
 FREE_GENERATIONS = 3
 
 # ============ ЦЕНЫ ============
@@ -65,7 +65,6 @@ except Exception:
 conn = sqlite3.connect(DATA_DIR / "users.db", check_same_thread=False)
 cursor = conn.cursor()
 
-# Создаем таблицы
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
@@ -108,20 +107,16 @@ cursor.execute("""
 """)
 conn.commit()
 
-# ============ АВТОМАТИЧЕСКАЯ МИГРАЦИЯ БД ============
-# Это защитит от ошибки "no such column: onboarded", если база старая
+# Миграция для старых баз
 def check_db_columns():
     cursor.execute("PRAGMA table_info(users)")
     columns = [row[1] for row in cursor.fetchall()]
     if "onboarded" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN onboarded INTEGER DEFAULT 0")
-        logger.info("🔧 Миграция БД: добавлена колонка onboarded")
     if "referrals" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN referrals INTEGER DEFAULT 0")
-        logger.info("🔧 Миграция БД: добавлена колонка referrals")
     if "balance" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 3")
-        logger.info("🔧 Миграция БД: добавлена колонка balance")
     conn.commit()
 
 check_db_columns()
@@ -168,6 +163,7 @@ def try_deduct_balance(user_id: int, amount: int) -> bool:
 def refund_balance(user_id: int, amount: int):
     cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
     conn.commit()
+    logger.info(f"💰 Возврат {amount} генераций пользователю {user_id}")
 
 def set_onboarded(user_id: int):
     cursor.execute("UPDATE users SET onboarded = 1 WHERE user_id = ?", (user_id,))
@@ -194,7 +190,13 @@ def get_pack_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="1 карточка — 1 генерация", callback_data="pack:1")],
         [InlineKeyboardButton(text="3 карточки — 2 генерации (выгода)", callback_data="pack:3")],
-        [InlineKeyboardButton(text="5 карточек — 4 генерации (макс. выгода)", callback_data="pack:5")]
+        [InlineKeyboardButton(text="5 карточек — 4 генерации (макс. выгода)", callback_data="pack:5")],
+        [InlineKeyboardButton(text="📖 Примеры и советы", callback_data="show_examples")]
+    ])
+
+def get_cancel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_creation")]
     ])
 
 # ============ /START И ТУР ============
@@ -236,7 +238,6 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
 async def start_tour(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     set_onboarded(cb.from_user.id)
-    # ИСПРАВЛЕНИЕ: Удаляем старое сообщение и отправляем новое, чтобы повесить Reply-кнопки
     try:
         await cb.message.delete()
     except Exception:
@@ -251,7 +252,6 @@ async def start_tour(cb: types.CallbackQuery, state: FSMContext):
 async def skip_tour(cb: types.CallbackQuery):
     await cb.answer()
     set_onboarded(cb.from_user.id)
-    # ИСПРАВЛЕНИЕ: Удаляем старое сообщение и отправляем новое
     try:
         await cb.message.delete()
     except Exception:
@@ -271,6 +271,22 @@ async def create_pack_start(message: types.Message, state: FSMContext):
         return
     await message.answer("📦 Выберите размер пака:", reply_markup=get_pack_kb())
 
+@dp.callback_query(F.data == "show_examples")
+async def show_examples(cb: types.CallbackQuery):
+    await cb.answer()
+    await cb.message.answer(
+        "📖 <b>Как делать правильные карточки:</b>\n\n"
+        "1️⃣ <b>Фото товара:</b> снимайте при дневном свете, товар целиком, без обрезанных краев.\n"
+        "2️⃣ <b>Описание фона:</b> пишите конкретно, где стоит товар и какой свет.\n"
+        "3️⃣ <b>Место под текст:</b> добавьте в промпт «слева свободное место для текста».\n\n"
+        "🎨 <b>Примеры удачных промптов:</b>\n"
+        "• <i>Минимализм:</i> <code>Товар на светлом мраморном подиуме, утренний свет, слева место под текст</code>\n"
+        "• <i>Эко:</i> <code>Товар на деревянной столешнице, уютная светлая кухня на фоне, теплый студийный свет</code>\n"
+        "• <i>Премиум:</i> <code>Товар на темном матовом камне, контровой холодный свет, рекламная съемка</code>\n\n"
+        "<i>Совет: не пишите «сделай красиво», пишите конкретные детали обстановки.</i>",
+        parse_mode="HTML"
+    )
+
 @dp.callback_query(F.data.startswith("pack:"))
 async def process_pack_size(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -284,19 +300,23 @@ async def process_pack_size(cb: types.CallbackQuery, state: FSMContext):
     
     await state.update_data(pack_size=size, pack_price=price)
     await state.set_state(BotStates.waiting_for_photo)
+    
     await cb.message.edit_text(
         f"✅ Выбран пак: {size} карточек.\n"
         f"Спишется: {price} генераций.\n\n"
-        f"📸 Теперь загрузите фото вашего товара:"
+        f"📸 Теперь загрузите фото вашего товара:",
+        reply_markup=get_cancel_kb()
     )
 
 @dp.message(BotStates.waiting_for_photo, F.photo)
 async def process_photo(message: types.Message, state: FSMContext):
     await state.update_data(photo_id=message.photo[-1].file_id)
     await state.set_state(BotStates.waiting_for_prompt)
+    
     await message.answer(
         "✍️ Напишите описание стиля.\n"
         "<i>Например: «на светлом мраморном столике, мягкий свет, эко-стиль».</i>",
+        reply_markup=get_cancel_kb(),
         parse_mode="HTML"
     )
 
@@ -308,7 +328,7 @@ async def wrong_photo(message: types.Message):
 @dp.message(BotStates.waiting_for_prompt)
 async def process_generation(message: types.Message, state: FSMContext):
     if not message.text:
-        await message.answer("❌ Напишите описание текстом.")
+        await message.answer("❌ Напишите описание текстом.", reply_markup=get_cancel_kb())
         return
 
     data = await state.get_data()
@@ -329,11 +349,9 @@ async def process_generation(message: types.Message, state: FSMContext):
     wait_msg = await message.answer(f"⏳ Создаю {pack_size} карточек. Это займёт 20-40 секунд...")
     
     try:
-        # Скачиваем фото пользователя
         file_info = await bot.get_file(photo_id)
         photo_bytes = BytesIO()
         await bot.download_file(file_info.file_path, photo_bytes)
-        photo_bytes.seek(0)
 
         backgrounds = []
         user_prompt = message.text.strip()[:400]
@@ -343,6 +361,9 @@ async def process_generation(message: types.Message, state: FSMContext):
         
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for i in range(pack_size):
+                # ИСПРАВЛЕНИЕ: сбрасываем курсор файла в начало перед каждым запросом!
+                photo_bytes.seek(0)
+                
                 angle_prompts = [
                     "Главный кадр. Товар по центру.",
                     "Ракурс 3/4, виден объем товара.",
@@ -406,13 +427,26 @@ async def process_generation(message: types.Message, state: FSMContext):
         logger.exception("Ошибка генерации")
         refund_balance(message.from_user.id, pack_price)
         try:
-            await wait_msg.edit_text("❌ Ошибка при генерации. Генерации возвращены на баланс. Попробуйте позже.")
+            await wait_msg.edit_text(
+                "❌ Ошибка при генерации. Генерации возвращены на баланс.\n"
+                "Попробуйте другое фото или упростите описание."
+            )
         except Exception:
             await message.answer("❌ Ошибка при генерации. Генерации возвращены на баланс.")
     finally:
         await state.clear()
 
-# ============ ZIP И ПЕРЕДЕЛКА ============
+# ============ ОТМЕНА И ZIP ============
+@dp.callback_query(F.data == "cancel_creation")
+async def cancel_creation(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer("Отменено")
+    await state.clear()
+    try:
+        await cb.message.edit_text("❌ Создание отменено.")
+    except Exception:
+        pass
+    await cb.message.answer("Вы вернулись в главное меню.", reply_markup=main_kb)
+
 @dp.callback_query(F.data.startswith("zip:"))
 async def send_zip(cb: types.CallbackQuery):
     await cb.answer()
@@ -471,7 +505,7 @@ async def process_redo(cb: types.CallbackQuery, state: FSMContext):
     
     await state.update_data(pack_size=size, pack_price=1)
     await state.set_state(BotStates.waiting_for_photo)
-    await cb.message.answer("📸 Загрузите фото товара:")
+    await cb.message.answer("📸 Загрузите фото товара:", reply_markup=get_cancel_kb())
 
 @dp.callback_query(F.data == "create_more")
 async def create_more(cb: types.CallbackQuery):
