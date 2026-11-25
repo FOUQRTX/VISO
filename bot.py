@@ -45,7 +45,7 @@ dp = Dispatcher()
 
 PROXYAPI_URL = "https://api.proxyapi.ru/openai/v1"
 MODEL = "gpt-image-1.5"
-FREE_GENERATIONS = 3
+FREE_GENERATIONS = 1
 
 # ============ ЦЕНЫ ============
 PRICE_SINGLE = 1
