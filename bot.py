@@ -68,7 +68,7 @@ cursor = conn.cursor()
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
-        balance INTEGER DEFAULT 3,
+        balance INTEGER DEFAULT 1,
         referrals INTEGER DEFAULT 0,
         onboarded INTEGER DEFAULT 0
     )
