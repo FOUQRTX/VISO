@@ -22,8 +22,6 @@ from aiogram.types import (
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from PIL import Image
-from rembg import remove
 
 # ============ ЛОГИРОВАНИЕ ============
 logging.basicConfig(
@@ -49,7 +47,7 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 PROXYAPI_URL = "https://api.proxyapi.ru/openai/v1"
-MODEL = "gpt-image-1.5"
+MODEL = "gpt-image-1.5"  # Если не работает, замените на "gpt-image-1"
 FREE_GENERATIONS = 3
 
 # ============ ЦЕНЫ ============
@@ -177,15 +175,6 @@ main_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-def get_style_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Минимализм ⬜", callback_data="style:minimal")],
-        [InlineKeyboardButton(text="Эко 🌿", callback_data="style:eco")],
-        [InlineKeyboardButton(text="Премиум 💎", callback_data="style:premium")],
-        [InlineKeyboardButton(text="Неон ⚡", callback_data="style:neon")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
-    ])
-
 def get_pack_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="1 карточка — 1 генерация", callback_data="pack:1")],
@@ -300,7 +289,6 @@ async def process_generation(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    # Списываем генерации
     if not try_deduct_balance(message.from_user.id, pack_price):
         await message.answer("❌ Закончились генерации! Пополните баланс в «💎 Тарифы».")
         await state.clear()
@@ -309,29 +297,11 @@ async def process_generation(message: types.Message, state: FSMContext):
     wait_msg = await message.answer(f"⏳ Создаю {pack_size} карточек. Это займёт 20-40 секунд...")
     
     try:
-        # Скачиваем фото
         file_info = await bot.get_file(photo_id)
         photo_bytes = BytesIO()
         await bot.download_file(file_info.file_path, photo_bytes)
         photo_bytes.seek(0)
 
-        # Вырезаем объект
-        try:
-            # rembg работает синхронно, лучше вынести в поток, но для простоты оставим тут
-            input_img = Image.open(photo_bytes)
-            output_img = remove(input_img)
-            
-            # Сохраняем результат в BytesIO
-            img_byte_arr = BytesIO()
-            output_img.save(img_byte_arr, format='PNG')
-            img_byte_arr.seek(0)
-            object_bytes = img_byte_arr.getvalue()
-        except Exception as e:
-            logger.error(f"Ошибка rembg: {e}")
-            # Fallback: если rembg упал, шлем оригинал (для теста, чтобы бот не падал)
-            object_bytes = photo_bytes.getvalue()
-
-        # Генерируем фоны
         backgrounds = []
         user_prompt = message.text.strip()[:400]
         
@@ -340,7 +310,6 @@ async def process_generation(message: types.Message, state: FSMContext):
         
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for i in range(pack_size):
-                # Меняем промпт для разнообразия ракурсов
                 angle_prompts = [
                     "Главный кадр. Товар по центру.",
                     "Ракурс 3/4, виден объем товара.",
@@ -348,55 +317,34 @@ async def process_generation(message: types.Message, state: FSMContext):
                     "Вид сверху (флэтлей) с небольшим декором.",
                     "Крупный план детали товара."
                 ]
-                prompt = f"Коммерческая карточка для маркетплейса. {user_prompt}. {angle_prompts[i % len(angle_prompts)]}. Без текста и логотипов."
+                prompt = (
+                    f"Коммерческая карточка для маркетплейса. Сохрани сам товар без изменений. "
+                    f"Замени только фон и освещение: {user_prompt}. {angle_prompts[i % len(angle_prompts)]}. "
+                    f"Без текста, надписей и логотипов."
+                )
                 
-                payload = {
-                    "model": MODEL,
-                    "prompt": prompt,
-                    "size": "1024x1536",
-                    "quality": "medium",
-                    "n": 1
-                }
+                form = aiohttp.FormData()
+                form.add_field("model", MODEL)
+                form.add_field("prompt", prompt)
+                form.add_field("size", "1024x1536")
+                form.add_field("quality", "medium")
+                form.add_field("image", photo_bytes, filename="image.jpg", content_type="image/jpeg")
                 
-                async with session.post(f"{PROXYAPI_URL}/images/generations", json=payload, headers=headers) as resp:
+                async with session.post(f"{PROXYAPI_URL}/images/edits", data=form, headers=headers) as resp:
                     if resp.status != 200:
                         err = await resp.text()
                         raise RuntimeError(f"API {resp.status}: {err[:200]}")
                     res_json = await resp.json()
                 
                 b64_img = res_json["data"][0]["b64_json"]
-                bg_bytes = base64.b64decode(b64_img)
-                
-                # Накладываем вырезанный объект на сгенерированный фон
-                bg_img = Image.open(BytesIO(bg_bytes)).convert("RGBA")
-                fg_img = Image.open(BytesIO(object_bytes)).convert("RGBA")
-                
-                # Масштабируем объект (примерно 50% от фона)
-                fg_width = int(bg_img.width * 0.5)
-                fg_height = int(fg_img.height * (fg_width / fg_img.width))
-                fg_img = fg_img.resize((fg_width, fg_height), Image.Resampling.LANCZOS)
-                
-                # Позиционируем по центру
-                x = (bg_img.width - fg_width) // 2
-                y = (bg_img.height - fg_height) // 2
-                
-                # Накладываем
-                bg_img.paste(fg_img, (x, y), fg_img)
-                
-                # Сохраняем в буфер
-                final_io = BytesIO()
-                bg_img.convert("RGB").save(final_io, format="JPEG", quality=95)
-                final_io.seek(0)
-                backgrounds.append(final_io)
+                backgrounds.append(BytesIO(base64.b64decode(b64_img)))
 
-        # Отправляем альбомом
         media_group = []
         for i, bg in enumerate(backgrounds):
             media_group.append(types.InputMediaPhoto(media=BufferedInputFile(bg.read(), filename=f"card_{i+1}.jpg")))
 
         sent_messages = await message.answer_media_group(media_group)
         
-        # Сохраняем в БД
         pack_id = str(uuid.uuid4())[:8]
         file_ids = ",".join([m.photo[-1].file_id for m in sent_messages])
         cursor.execute(
@@ -405,7 +353,6 @@ async def process_generation(message: types.Message, state: FSMContext):
         )
         conn.commit()
 
-        # Кнопки под результатом
         result_kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Переделать", callback_data=f"redo:{pack_id}")],
             [InlineKeyboardButton(text="📦 Собрать ZIP", callback_data=f"zip:{pack_id}")],
@@ -477,12 +424,10 @@ async def process_redo(cb: types.CallbackQuery, state: FSMContext):
     user = ensure_user(cb.from_user.id)
     
     if redo_used < FREE_REDO_PER_PACK:
-        # Бесплатно
         cursor.execute("UPDATE packs SET redo_used = redo_used + 1 WHERE pack_id = ?", (pack_id,))
         conn.commit()
         await cb.message.answer("🔄 Первая переделка бесплатна. Загрузите новое фото или описание заново.")
     else:
-        # Платно
         if user[0] < PRICE_REDO:
             await cb.message.answer("❌ Недостаточно генераций для переделки. Нужно: 1.")
             return
@@ -491,8 +436,7 @@ async def process_redo(cb: types.CallbackQuery, state: FSMContext):
         conn.commit()
         await cb.message.answer("🔄 Списан 1 генерация. Загрузите фото и описание заново.")
     
-    # Запускаем процесс заново
-    await state.update_data(pack_size=size, pack_price=1) # price 1, так как уже списали
+    await state.update_data(pack_size=size, pack_price=1)
     await state.set_state(BotStates.waiting_for_photo)
     await cb.message.answer("📸 Загрузите фото товара:")
 
@@ -500,6 +444,11 @@ async def process_redo(cb: types.CallbackQuery, state: FSMContext):
 async def create_more(cb: types.CallbackQuery):
     await cb.answer()
     await cb.message.answer("Выберите размер нового пака:", reply_markup=get_pack_kb())
+
+@dp.callback_query(F.data == "back_to_menu")
+async def back_to_menu(cb: types.CallbackQuery):
+    await cb.answer()
+    await cb.message.delete()
 
 # ============ ПРОФИЛЬ И ТАРИФЫ ============
 @dp.message(F.text == "👤 Мой профиль")
